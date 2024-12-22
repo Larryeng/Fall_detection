@@ -18,5 +18,4 @@ jobs:
               uses: Lin-jun-xiang/action-translate-readme@v2 # Based on the tag
               with:
                 token: ${{ secrets.Action_Bot }} # Based on step2 name
-                g4f_provider: g4f.Provider.OpenAi # You can change this provider
                 langs: "en,zh-TW,zh-CN,French,Arabic" # You can define any langs
