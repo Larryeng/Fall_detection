@@ -5,4 +5,3 @@ In today's aging society, the safety of elderly individuals has become a signifi
 
 ## Expected Benefits  
 When a fall is detected, and the elderly person does not press the button within 10 seconds, the bracelet will automatically send a notification via Discord, requesting a callback to confirm their condition. This ensures timely assistance and helps determine whether an ambulance is needed.  
-
