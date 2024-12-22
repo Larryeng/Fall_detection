@@ -1,6 +1,7 @@
-# 跌倒偵測手環研發
-## 動機
-> 在這個銀髮族越來越多的世代中，老人家的安全防護都備受關注，外面市售的智慧手錶價格昂貴裡頭功能又不一定是老人家會用到的，於是我想發明自己的跌倒偵測智慧手環給老人家做使用,在偵測到跌倒時，能夠發送簡訊通知親友。這使在外工作的年輕人能夠時刻關心家裡長輩的安全，才不會因為一時疏忽而留下遺憾。
-## 預期效益
-> 預期當老人跌倒時並且長輩沒有在10秒內按下按鈕並透過手錶自動發送discord訊息並請他回撥電話確認，以確保使否需要叫救護車
+# Fall Detection Smart Bracelet Development  
 
+## Motivation  
+In today's aging society, the safety of elderly individuals has become a significant concern. Commercially available smartwatches are often expensive and include features that may not be useful for seniors. Therefore, I aim to create a fall detection smart bracelet specifically designed for the elderly. This bracelet will send notifications to family members when a fall is detected, allowing young people working away from home to stay informed about the safety of their elderly loved ones. This proactive approach can help prevent regrets caused by delayed responses.  
+
+## Expected Benefits  
+When a fall is detected, and the elderly person does not press the button within 10 seconds, the bracelet will automatically send a notification via Discord, requesting a callback to confirm their condition. This ensures timely assistance and helps determine whether an ambulance is needed.  
