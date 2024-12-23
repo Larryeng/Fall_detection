@@ -28,6 +28,17 @@ const int BUTTON_PIN = 2;
 //LED 設定
 CRGB leds[1];
 //===========================================================
+//偵測重置
+void resetDetection()
+{
+    startF = false;
+    Fallen = false;
+    lying = false;
+    leds[0] = CRGB::Black;
+    FastLED.show();
+    digitalWrite(4, HIGH); //關閉蜂鳴器
+    Serial.println("偵測狀態重置完成");
+}
 //警報觸發
 void Alarm()
 {
@@ -71,18 +82,7 @@ void Alarm()
     {
         Serial.println("Wi-Fi 未連線，無法傳送警報！");
     }
-}
-
-//偵測重置
-void resetDetection()
-{
-    startF = false;
-    Fallen = false;
-    lying = false;
-    leds[0] = CRGB::Black;
-    FastLED.show();
-    digitalWrite(4, HIGH); //關閉蜂鳴器
-    Serial.println("偵測狀態重置完成");
+    resetDetection();
 }
 //===========================================================
 //===========================================================
