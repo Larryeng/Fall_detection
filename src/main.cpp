@@ -10,7 +10,7 @@
 //===========================================================
 const char *ssid = "Galaxy A52s 5G";  //Wi-Fi 名稱
 const char *password = "Larry970411"; //Wi-Fi 密碼
-const char *discordWebhook = "https://discord.com/api/webhooks/1308277921416351796/m_hdBxAEGPhGKQRgTEw7ZaxPKenkuq82VKNOhJPKwknnWlJF2LNgOGPYvhgehtX1wdrj";
+const char *discordWebhook = "https://discord.com/api/webhooks/1308277921416351796/m_hdBxAEGPhGKQRgTEw7ZaxPKenkuq82VKNOhJPKwknnWlJF2LNgOGPYvhgehtX1wdrj"  //your Discord APi(This APi is unusable,Don't use it😒);
 //加速度計
 Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
 //標記變數設定
