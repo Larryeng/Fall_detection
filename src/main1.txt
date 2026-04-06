@@ -1,0 +1,522 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_ADXL345_U.h>
+#include <FastLED.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <esp_wifi.h>
+#include <math.h>
+
+// ===== Hardware pins (Beetle ESP32-C3) =====
+#define BUZZER_PIN 4          // active-low: HIGH=off, LOW=on
+#define BUTTON_PIN 2          // INPUT_PULLUP
+#define LED_PIN    1          // WS2812B data pin
+#define NUM_LEDS   1
+CRGB leds[NUM_LEDS];
+
+// ===== Wi-Fi / Webhook (換成你自己的，或改用 secrets.h) =====
+const char* ssid = "安祐的S25 Ultra";
+const char* password = "0981282018";
+const char* discordWebhook = "https://discord.com/api/webhooks/1419319374095061183/jKFMp8E0XEA2gXXhyqUGXU5fdKkKY_Wx9CCc8dzwY012saAubzivFLC7sxz_3YSPSwR-";
+
+// ===== ADXL345 / filters / thresholds (可在 /tune 調) =====
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
+WebServer server(80);
+
+const float G = 9.80665f;
+
+// ---- Base thresholds ----
+float FF_G  = 0.7f;     // free-fall < 0.7 g（測試較容易觸發；正式可 0.5）
+uint32_t FF_MS = 120;   // 自由落下需連續時間（正式可 200）
+
+float IMP_G  = 2.5f;    // impact > 2.5 g（正式可 3.0~3.5）
+uint32_t IMP_MS = 40;   // 衝擊需連續時間（正式可 80）
+
+float INACT_LOW  = 0.6f;    // 靜止帶下界（正式可 0.5）
+float INACT_HIGH = 1.4f;    // 靜止帶上界（正式可 1.2）
+uint32_t INACT_MS = 900;    // 靜止需維持時間（正式可 1200~1500）
+
+uint32_t MAX_FF_TO_IMPACT_MS = 1500; // 自由落下到衝擊最大間隔
+float ORIENT_DEG = 45.0f;            // 姿態角度門檻（正式可 60）
+
+float IMP_HARD_G  = 4.0f;    // 後備：強衝擊門檻（無 FF 也能進 Impact）
+uint32_t IMP_HARD_MS = 20;   // 後備：強衝擊需維持
+
+float EMA_ALPHA = 0.2f;      // 0~1；越小越平滑（僅用於靜止判斷）
+
+// ODR（可在 /tune 改 100/200/400）
+int odr_hz = 200;
+
+// ===== State =====
+enum FDState { Idle, FreeFall, Impact, PreAlarm };
+FDState state = Idle;
+
+float aG_ema = 1.0f;
+float basePitch = 0.0f, baseRoll = 0.0f;
+uint32_t tFFStart=0, tImpactStart=0, tInactStart=0;
+uint32_t preAlarmUntil = 0, blinkTicker = 0;
+bool buzzerOn=false, ledOn=false;
+
+bool wifiConnected = false;
+
+// 顯示用：角速度估算（不參與判斷）
+float angRate = 0.0f;  // deg/s
+float lastPitch = 0, lastRoll = 0;
+uint32_t lastTs = 0;
+
+// ===== Helpers =====
+static inline float vecMagG(const sensors_event_t& e){
+  float mps2 = sqrtf(e.acceleration.x*e.acceleration.x +
+                     e.acceleration.y*e.acceleration.y +
+                     e.acceleration.z*e.acceleration.z);
+  return mps2 / G;
+}
+static inline void accelAngles(const sensors_event_t& e, float& pitch, float& roll){
+  float Ax=e.acceleration.x, Ay=e.acceleration.y, Az=e.acceleration.z;
+  pitch = atan2f(-Ax, sqrtf(Ay*Ay + Az*Az)) * 180.0f/PI;
+  roll  = atan2f(Ay, Az) * 180.0f/PI;
+}
+static inline float angleDelta(float a, float b){
+  float d = fabsf(a - b); if(d > 180.0f) d = 360.0f - d; return d;
+}
+void beepOn(){ digitalWrite(BUZZER_PIN, LOW); }
+void beepOff(){ digitalWrite(BUZZER_PIN, HIGH); }
+
+bool i2cPresent(uint8_t addr){ Wire.beginTransmission(addr); return (Wire.endTransmission()==0); }
+bool tryInitAccelPins(int sda,int scl){
+  Wire.end(); Wire.begin(sda,scl); delay(10);
+  if(!(i2cPresent(0x53) || i2cPresent(0x1D))) return false;
+  if(!accel.begin()) return false;
+  Serial.printf("ADXL345 連上，I2C: SDA=%d SCL=%d\n", sda, scl);
+  return true;
+}
+bool initAccelAuto(){
+  const int cand[][2]={{8,9},{7,6},{6,7}};
+  for(auto&p:cand) if(tryInitAccelPins(p[0],p[1])) return true;
+  Wire.end(); Wire.begin();
+  if((i2cPresent(0x53)||i2cPresent(0x1D)) && accel.begin()){
+    Serial.println("ADXL345 連上（預設 I2C 腳位）"); return true;
+  }
+  return false;
+}
+
+// ⚠️ 正確型別：dataRate_t（Adafruit ADXL345 v1.3.4）
+void applyODR(int hz){
+  odr_hz = hz;
+  dataRate_t rate = ADXL345_DATARATE_200_HZ;
+  if (hz >= 350)      rate = ADXL345_DATARATE_400_HZ;
+  else if (hz >= 180) rate = ADXL345_DATARATE_200_HZ;
+  else                rate = ADXL345_DATARATE_100_HZ;
+  accel.setDataRate(rate);
+  Serial.printf("ADXL345 ODR 設為 ~%d Hz\n", hz);
+}
+
+void resetDetection(){
+  state=Idle; tFFStart=tImpactStart=tInactStart=0;
+  preAlarmUntil=0; blinkTicker=0; buzzerOn=false; ledOn=false;
+  leds[0]=CRGB::Black; FastLED.show(); beepOff();
+  Serial.println("偵測狀態重置完成");
+}
+
+void sendDiscord(){
+  if(WiFi.status()!=WL_CONNECTED){ Serial.println("Wi-Fi 未連線，無法傳送警報！"); return; }
+  HTTPClient http; http.begin(discordWebhook);
+  http.addHeader("Content-Type","application/json");
+  String payload = R"({"username":"Fall Detection Bot","embeds":[{"title":"⚠️ 跌倒警報觸發！請立即查看配戴者狀況。","color":16711680,"image":{"url":"https://i.imgur.com/pTOOLNc.gif"}}]})";
+  int code=http.POST(payload); Serial.printf("Webhook 回應碼: %d\n", code); http.end();
+}
+
+// ====== Web pages ======
+const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html><html lang="zh-Hant"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>ADXL345 即時監看</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:16px;background:#0b0c10;color:#eaf0f6}
+h1{font-size:20px;margin:0 0 12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.card{background:#151a21;border:1px solid #2a313b;border-radius:12px;padding:12px}
+.label{opacity:.7;font-size:12px}.value{font-size:22px;font-variant-numeric:tabular-nums}
+canvas{width:100%;height:160px;background:#0f1319;border:1px solid #2a313b;border-radius:8px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,"Ubuntu Mono",Consolas,monospace}
+.badge{display:inline-block;padding:2px 8px;border-radius:9999px;background:#243042;border:1px solid #2a313b;margin-left:8px}
+a.btn{display:inline-block;margin:8px 0;padding:6px 10px;border-radius:8px;border:1px solid #2a313b;background:#1a2230;color:#cfe3ff;text-decoration:none}
+.list{font-size:14px;line-height:1.45}
+.kv{display:flex;gap:8px;align-items:center}
+.k{opacity:.7;min-width:140px}
+</style></head><body>
+<h1>ADXL345 即時監看 <span id="state" class="badge">Idle</span> <a class="btn" href="/tune">/tune</a></h1>
+<div class="grid">
+  <div class="card"><div class="label">|a| g（原始 / EMA）</div><div id="gpair" class="value mono">-- / --</div></div>
+  <div class="card"><div class="label">角速度（deg/s）</div><div id="angrate" class="value mono">--</div></div>
+  <div class="card"><div class="label">Pitch / Roll (°)</div><div id="angles" class="value mono">--</div></div>
+  <div class="card"><div class="label">定時器（ms）</div>
+    <div class="list mono">
+      <div class="kv"><div class="k">FreeFall 進行：</div><div id="ffms">0</div></div>
+      <div class="kv"><div class="k">Impact 進行：</div><div id="impms">0</div></div>
+      <div class="kv"><div class="k">Inactivity 進行：</div><div id="inactms">0</div></div>
+      <div class="kv"><div class="k">PreAlarm 倒數：</div><div id="prems">0</div></div>
+    </div>
+  </div>
+  <div class="card"><div class="label">Thresholds（Base）</div>
+    <div class="list mono">
+      <div class="kv"><div class="k">FF_G / FF_MS：</div><div id="ff_pair">--</div></div>
+      <div class="kv"><div class="k">IMP_G / IMP_MS：</div><div id="imp_pair">--</div></div>
+      <div class="kv"><div class="k">INACT_LOW~HIGH / MS：</div><div id="inact_pair">--</div></div>
+      <div class="kv"><div class="k">ORIENT_DEG：</div><div id="ori_pair">--</div></div>
+      <div class="kv"><div class="k">IMP_HARD_G / MS：</div><div id="hard_pair">--</div></div>
+    </div>
+  </div>
+</div>
+<div class="card" style="margin-top:12px">
+  <div class="label">|a| 走勢 (最近 ~10 秒)</div>
+  <canvas id="chart" width="900" height="200"></canvas>
+</div>
+<script>
+const el=(id)=>document.getElementById(id);
+const N=200; const data=new Array(N).fill(0); let idx=0;
+const cvs=el('chart'); const ctx=cvs.getContext('2d');
+function draw(){
+  const w=cvs.width,h=cvs.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.globalAlpha=.5; ctx.beginPath(); ctx.moveTo(40,10); ctx.lineTo(40,h-20); ctx.lineTo(w-10,h-20);
+  ctx.strokeStyle='#2a313b'; ctx.stroke();
+  ctx.globalAlpha=1; ctx.beginPath();
+  const maxG=4.0;
+  for(let i=0;i<N;i++){const j=(idx+i)%N, val=data[j];
+    const x=40+(i*(w-50)/(N-1)); const y=(h-20)-Math.min(val/maxG,1)*(h-30);
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.strokeStyle='#99c1ff'; ctx.lineWidth=2; ctx.stroke();
+  ctx.fillStyle='#9aa6b2'; ctx.font='12px system-ui';
+  for(let g=0;g<=4;g++){const y=(h-20)-(g/4)*(h-30); ctx.fillText(g+' g',5,y+4);
+    ctx.beginPath(); ctx.moveTo(40,y); ctx.lineTo(w-10,y); ctx.strokeStyle='#1d232c'; ctx.stroke();}
+}
+async function tick(){
+  try{
+    const r=await fetch('/data',{cache:'no-store'}); const j=await r.json();
+    el('state').textContent=j.state;
+    el('gpair').textContent=j.aG_raw.toFixed(3)+' / '+j.aG_ema.toFixed(3);
+    el('angrate').textContent=j.angRate.toFixed(1);
+    el('angles').textContent=j.pitch.toFixed(1)+' / '+j.roll.toFixed(1);
+    el('ffms').textContent=j.ff_ms; el('impms').textContent=j.impact_ms;
+    el('inactms').textContent=j.inact_ms; el('prems').textContent=j.prealarm_ms;
+
+    el('ff_pair').textContent=j.base.FF_G.toFixed(2)+' / '+j.base.FF_MS;
+    el('imp_pair').textContent=j.base.IMP_G.toFixed(2)+' / '+j.base.IMP_MS;
+    el('inact_pair').textContent=j.base.INACT_LOW.toFixed(2)+'~'+j.base.INACT_HIGH.toFixed(2)+' / '+j.base.INACT_MS;
+    el('ori_pair').textContent=j.base.ORIENT_DEG.toFixed(0);
+    el('hard_pair').textContent=j.base.IMP_HARD_G.toFixed(2)+' / '+j.base.IMP_HARD_MS;
+
+    data[idx]=j.aG_raw; idx=(idx+1)%N; draw();
+  }catch(e){console.log(e);}
+}
+setInterval(tick,200); draw();
+</script></body></html>
+)HTML";
+
+const char TUNE_HTML[] PROGMEM = R"HTML(
+<!doctype html><html lang="zh-Hant"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Fall Detector - Tune</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:16px;background:#0b0c10;color:#eaf0f6}
+h1{font-size:20px;margin:0 0 12px}
+form{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.card{background:#151a21;border:1px solid #2a313b;border-radius:12px;padding:12px}
+label{font-size:12px;opacity:.8;display:block;margin-bottom:4px}
+input{width:100%;padding:8px;background:#0f1319;border:1px solid #2a313b;border-radius:8px;color:#dbe8ff}
+button{padding:10px 14px;border-radius:10px;border:1px solid #2a313b;background:#1a2230;color:#cfe3ff;cursor:pointer}
+.row{grid-column:1/-1}
+.badge{display:inline-block;padding:2px 8px;border-radius:9999px;background:#243042;border:1px solid #2a313b;margin-left:8px}
+a{color:#9dc1ff}
+</style></head><body>
+<h1>參數調整 <span id="status" class="badge">--</span>　<a href="/">回到儀表板</a></h1>
+<form id="f">
+ <div class="card"><label>FF_G (g)</label><input step="0.01" type="number" name="FF_G"></div>
+ <div class="card"><label>FF_MS (ms)</label><input step="10" type="number" name="FF_MS"></div>
+ <div class="card"><label>IMP_G (g)</label><input step="0.1" type="number" name="IMP_G"></div>
+ <div class="card"><label>IMP_MS (ms)</label><input step="5" type="number" name="IMP_MS"></div>
+ <div class="card"><label>INACT_LOW (g)</label><input step="0.01" type="number" name="INACT_LOW"></div>
+ <div class="card"><label>INACT_HIGH (g)</label><input step="0.01" type="number" name="INACT_HIGH"></div>
+ <div class="card"><label>INACT_MS (ms)</label><input step="10" type="number" name="INACT_MS"></div>
+ <div class="card"><label>ORIENT_DEG (°)</label><input step="1" type="number" name="ORIENT_DEG"></div>
+ <div class="card"><label>MAX_FF_TO_IMPACT_MS</label><input step="10" type="number" name="MAX_FF_TO_IMPACT_MS"></div>
+ <div class="card"><label>IMP_HARD_G (g)</label><input step="0.1" type="number" name="IMP_HARD_G"></div>
+ <div class="card"><label>IMP_HARD_MS (ms)</label><input step="1" type="number" name="IMP_HARD_MS"></div>
+ <div class="card"><label>EMA_ALPHA (0~1)</label><input step="0.05" type="number" name="EMA_ALPHA" min="0" max="1"></div>
+ <div class="card"><label>ODR (Hz: 100/200/400)</label><input step="100" type="number" name="odr"></div>
+ <div class="row"><button type="submit">套用 (RAM)</button>　<button id="resetBtn" type="button">重置狀態</button></div>
+</form>
+<script>
+const f=document.getElementById('f'), statusEl=document.getElementById('status'), resetBtn=document.getElementById('resetBtn');
+async function load(){
+  const j=await (await fetch('/params')).json();
+  for(const k in j){ if(f[k]) f[k].value=j[k]; }
+  statusEl.textContent='已載入';
+}
+f.addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const fd=new FormData(f);
+  const p=new URLSearchParams(); for(const [k,v] of fd.entries()) p.append(k,v);
+  const r=await fetch('/params',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});
+  statusEl.textContent=r.ok?'已套用':'失敗';
+});
+resetBtn.addEventListener('click', ()=>fetch('/reset'));
+load();
+</script>
+</body></html>
+)HTML";
+
+// ---- Routes ----
+void handleRoot(){ server.send(200,"text/html",INDEX_HTML); }
+void handleTune(){ server.send(200,"text/html",TUNE_HTML); }
+
+void handleData(){
+  sensors_event_t ev; accel.getEvent(&ev);
+  float Ax=ev.acceleration.x, Ay=ev.acceleration.y, Az=ev.acceleration.z;
+  float amag = sqrtf(Ax*Ax + Ay*Ay + Az*Az);
+  float aG   = amag / G;
+  float pitch, roll; accelAngles(ev, pitch, roll);
+
+  // 角速度（僅顯示，與判斷無關）
+  uint32_t now = millis();
+  if (lastTs) {
+    float dt = (now - lastTs) / 1000.0f;
+    if (dt > 0) {
+      float dp = angleDelta(pitch, lastPitch) / dt;
+      float dr = angleDelta(roll,  lastRoll)  / dt;
+      angRate = max(dp, dr);
+    }
+  }
+  lastPitch=pitch; lastRoll=roll; lastTs=now;
+
+  const char* s = (state==Idle)?"Idle":(state==FreeFall)?"FreeFall":(state==Impact)?"Impact":"PreAlarm";
+
+  // 計時器（顯示用）
+  uint32_t ff_ms     = (tFFStart    && aG<FF_G) ? (now - tFFStart) : 0;
+  uint32_t impact_ms = (tImpactStart&& aG>IMP_G) ? (now - tImpactStart) : 0;
+  uint32_t inact_ms  = (tInactStart && aG_ema>=INACT_LOW && aG_ema<=INACT_HIGH) ? (now - tInactStart) : 0;
+  uint32_t pre_ms    = (state==PreAlarm && (int32_t)(preAlarmUntil - now) > 0) ? (preAlarmUntil - now) : 0;
+
+  String json = "{";
+  json += "\"state\":\""+String(s)+"\",";
+  json += "\"aG_raw\":"+String(aG,6)+",\"aG_ema\":"+String(aG_ema,6)+",";
+  json += "\"x\":"+String(Ax,6)+",\"y\":"+String(Ay,6)+",\"z\":"+String(Az,6)+",";
+  json += "\"pitch\":"+String(pitch,3)+",\"roll\":"+String(roll,3)+",";
+  json += "\"angRate\":"+String(angRate,3)+","; // 顯示用途
+  json += "\"ff_ms\":"+String(ff_ms)+",\"impact_ms\":"+String(impact_ms)+",\"inact_ms\":"+String(inact_ms)+",\"prealarm_ms\":"+String(pre_ms)+",";
+
+  // base 門檻
+  json += "\"base\":{";
+  json += "\"FF_G\":"+String(FF_G,3)+",\"FF_MS\":"+String(FF_MS)+",";
+  json += "\"IMP_G\":"+String(IMP_G,3)+",\"IMP_MS\":"+String(IMP_MS)+",";
+  json += "\"INACT_LOW\":"+String(INACT_LOW,3)+",\"INACT_HIGH\":"+String(INACT_HIGH,3)+",\"INACT_MS\":"+String(INACT_MS)+",";
+  json += "\"ORIENT_DEG\":"+String(ORIENT_DEG,1)+",\"IMP_HARD_G\":"+String(IMP_HARD_G,3)+",\"IMP_HARD_MS\":"+String(IMP_HARD_MS);
+  json += "}";
+  json += "}";
+  server.send(200,"application/json",json);
+}
+
+void handleParamsGet(){
+  String s="{";
+  s += "\"FF_G\":"+String(FF_G,3)+",\"FF_MS\":"+String(FF_MS);
+  s += ",\"IMP_G\":"+String(IMP_G,3)+",\"IMP_MS\":"+String(IMP_MS);
+  s += ",\"INACT_LOW\":"+String(INACT_LOW,3)+",\"INACT_HIGH\":"+String(INACT_HIGH,3)+",\"INACT_MS\":"+String(INACT_MS);
+  s += ",\"ORIENT_DEG\":"+String(ORIENT_DEG,1)+",\"MAX_FF_TO_IMPACT_MS\":"+String(MAX_FF_TO_IMPACT_MS);
+  s += ",\"IMP_HARD_G\":"+String(IMP_HARD_G,2)+",\"IMP_HARD_MS\":"+String(IMP_HARD_MS);
+  s += ",\"EMA_ALPHA\":"+String(EMA_ALPHA,2)+",\"odr\":"+String(odr_hz);
+  s += "}";
+  server.send(200,"application/json",s);
+}
+
+// /params POST（x-www-form-urlencoded）
+void handleParamsPost(){
+  auto getF=[&](const String& name, float& var, float minv, float maxv){
+    if(!server.hasArg(name)) return;
+    float v = server.arg(name).toFloat();
+    if(isnan(v)) return;
+    if(v<minv) v=minv; if(v>maxv) v=maxv;
+    var = v;
+  };
+  auto getU=[&](const String& name, uint32_t& var, uint32_t minv, uint32_t maxv){
+    if(!server.hasArg(name)) return;
+    long v = server.arg(name).toInt();
+    if(v<(long)minv) v=minv; if(v>(long)maxv) v=maxv;
+    var = (uint32_t)v;
+  };
+
+  getF("FF_G",FF_G,0.1f,2.0f);           getU("FF_MS",FF_MS,20,2000);
+  getF("IMP_G",IMP_G,1.0f,8.0f);         getU("IMP_MS",IMP_MS,5,500);
+  getF("INACT_LOW",INACT_LOW,0.1f,2.0f); getF("INACT_HIGH",INACT_HIGH,0.2f,3.0f);
+  if(INACT_HIGH<INACT_LOW) INACT_HIGH=INACT_LOW+0.05f;
+  getU("INACT_MS",INACT_MS,200,8000);
+  getF("ORIENT_DEG",ORIENT_DEG,10.0f,120.0f);
+  getU("MAX_FF_TO_IMPACT_MS",MAX_FF_TO_IMPACT_MS,200,8000);
+  getF("IMP_HARD_G",IMP_HARD_G,2.0f,12.0f); getU("IMP_HARD_MS",IMP_HARD_MS,5,500);
+  getF("EMA_ALPHA",EMA_ALPHA,0.05f,0.9f);
+
+  if(server.hasArg("odr")){
+    int hz = server.arg("odr").toInt();
+    if(hz<100) hz=100; if(hz>400) hz=400;
+    if(hz<150) hz=100; else if(hz<300) hz=200; else hz=400;
+    applyODR(hz);
+  }
+  handleParamsGet(); // 回傳更新後的 JSON
+}
+
+void handleReset(){
+  resetDetection();
+  server.send(200,"text/plain","reset");
+}
+
+// ===== Setup / Loop =====
+void setup(){
+  Serial.begin(115200);
+  uint32_t t0=millis(); while(!Serial && millis()-t0<2000){ delay(10); }
+
+  pinMode(BUZZER_PIN,OUTPUT); beepOff();
+  pinMode(BUTTON_PIN,INPUT_PULLUP);
+  FastLED.addLeds<WS2812,LED_PIN,RGB>(leds,NUM_LEDS);
+  leds[0]=CRGB::Black; FastLED.show();
+
+  Serial.println("Booting...");
+
+  // Wi-Fi
+  WiFi.mode(WIFI_STA); WiFi.persistent(false); WiFi.setSleep(false);
+  WiFi.setHostname("fall-detector"); WiFi.begin(ssid,password);
+  Serial.print("連線到 Wi-Fi");
+  t0=millis();
+  while(WiFi.status()!=WL_CONNECTED && millis()-t0<12000){ delay(300); Serial.print("."); }
+  if(WiFi.status()==WL_CONNECTED){
+    wifiConnected=true;
+    Serial.printf("\nWi-Fi 已連線，IP: %s  RSSI: %d dBm\n",
+      WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  }else{
+    wifiConnected=false; Serial.println("\nWi-Fi 連線逾時，背景持續重試…");
+  }
+
+  // I2C / ADXL345
+  if(!initAccelAuto()){
+    Serial.println("找不到 ADXL345，請檢查 I2C 線序（已嘗試 8/9、7/6、6/7）。");
+    while(1){ delay(1000); }
+  }
+  accel.setRange(ADXL345_RANGE_16_G);
+  applyODR(odr_hz);
+  Serial.println("ADXL345 初始化完成");
+
+  // Web
+  server.on("/",      handleRoot);
+  server.on("/data",  handleData);
+  server.on("/tune",  handleTune);
+  server.on("/params",HTTP_GET,  handleParamsGet);
+  server.on("/params",HTTP_POST, handleParamsPost);
+  server.on("/reset", handleReset);
+  server.begin(); Serial.println("HTTP 伺服器啟動");
+}
+
+void loop(){
+  server.handleClient();
+
+  // Wi-Fi 背景重連 + IP提示
+  static uint32_t lastCheck=0;
+  if(millis()-lastCheck>1000){
+    lastCheck=millis();
+    wl_status_t st=WiFi.status();
+    if(st==WL_CONNECTED && !wifiConnected){
+      wifiConnected=true;
+      Serial.printf("Wi-Fi 重新連上，IP: %s  RSSI: %d dBm\n",
+        WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    }else if(st!=WL_CONNECTED && wifiConnected){
+      wifiConnected=false; Serial.println("Wi-Fi 已斷線，嘗試重連…");
+    }
+    if(!wifiConnected){
+      static uint32_t lastRetry=0;
+      if(millis()-lastRetry>5000){ lastRetry=millis(); WiFi.disconnect(); WiFi.begin(ssid,password); }
+    }
+  }
+
+  // 感測
+  sensors_event_t ev; accel.getEvent(&ev);
+  float aG = vecMagG(ev);                       // 事件判斷用：原始 g 值
+  aG_ema = EMA_ALPHA*aG + (1-EMA_ALPHA)*aG_ema; // 靜止判斷用：平滑 g 值
+  float pitch, roll; accelAngles(ev,pitch,roll);
+  uint32_t now = millis();
+
+  // 立即取消鍵（任何狀態）
+  if(digitalRead(BUTTON_PIN)==LOW){ resetDetection(); return; }
+
+  // 狀態機
+  switch(state){
+    case Idle: {
+      // Free-fall（原始 aG）
+      if(aG < FF_G){
+        (tFFStart==0)? tFFStart=now : 0;
+        if(now - tFFStart >= FF_MS){
+          basePitch=pitch; baseRoll=roll;
+          state=FreeFall; tImpactStart=0;
+          Serial.println("偵測到自由落下");
+        }
+      }else tFFStart=0;
+
+      // 後備：強衝擊（原始 aG）
+      static uint32_t tHardImp=0;
+      if(aG > IMP_HARD_G){
+        (tHardImp==0)? tHardImp=now : 0;
+        if(now - tHardImp >= IMP_HARD_MS){
+          basePitch=pitch; baseRoll=roll;
+          state=Impact; tImpactStart=now; tInactStart=0;
+          Serial.println("偵測到強衝擊(無自由落下) → Impact");
+        }
+      }else tHardImp=0;
+    } break;
+
+    case FreeFall:
+      if(aG > IMP_G){
+        (tImpactStart==0)? tImpactStart=now : 0;
+        if(now - tImpactStart >= IMP_MS){
+          state=Impact; tInactStart=0;
+          Serial.println("偵測到衝擊");
+        }
+      }else{
+        tImpactStart=0;
+        if(now - tFFStart > MAX_FF_TO_IMPACT_MS) resetDetection();
+      }
+      break;
+
+    case Impact:
+      if(aG_ema >= INACT_LOW && aG_ema <= INACT_HIGH){
+        (tInactStart==0)? tInactStart=now : 0;
+        if(now - tInactStart >= INACT_MS){
+          float dPitch=angleDelta(pitch,basePitch);
+          float dRoll =angleDelta(roll, baseRoll);
+          if(max(dPitch,dRoll) >= ORIENT_DEG){
+            Serial.println("躺平+靜止+姿態改變 → PreAlarm");
+            state=PreAlarm; preAlarmUntil=now+10000;
+            blinkTicker=0; buzzerOn=false; ledOn=false;
+          }else{
+            resetDetection();
+          }
+        }
+      }else{
+        tInactStart=0;
+        if(now - tImpactStart > 3000) resetDetection();
+      }
+      break;
+
+    case PreAlarm:
+      if(now - blinkTicker >= 200){
+        blinkTicker = now;
+        ledOn = !ledOn; buzzerOn = !buzzerOn;
+        leds[0] = ledOn ? CRGB::Red : CRGB::Black; FastLED.show();
+        buzzerOn ? beepOn() : beepOff();
+      }
+      if((int32_t)(preAlarmUntil - now) <= 0){
+        leds[0]=CRGB::Black; FastLED.show(); beepOff();
+        sendDiscord(); resetDetection();
+      }
+      break;
+  }
+}
